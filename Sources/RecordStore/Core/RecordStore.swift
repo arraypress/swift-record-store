@@ -14,6 +14,10 @@
 //  exact before/after snapshots). Collections never start with an
 //  underscore, so the two can never collide.
 //
+//  A database written by 0.1 opens unchanged: its schemas have no key and no
+//  links, and the journal gains a nullable `batch` column the first time a
+//  newer store opens it — the only change made to an existing file.
+//
 
 import CryptoKit
 import Foundation
@@ -33,6 +37,12 @@ public final class RecordStore {
 
     /// The zone dates without an offset are read in.
     public var timeZone: TimeZone = .current
+
+    /// While one operation writes several journal entries (an import, a
+    /// forced delete), they share a batch so undo reverses them together.
+    var batching = false
+    var batchID: Int64?
+    var batchLabelled = false
 
     /// Opens (or creates) a store.
     public init(path: String) throws(RecordStoreError) {
@@ -54,8 +64,16 @@ public final class RecordStore {
                 "id" INTEGER PRIMARY KEY AUTOINCREMENT, "at" TEXT NOT NULL,
                 "collection" TEXT NOT NULL, "action" TEXT NOT NULL, "record_id" INTEGER,
                 "summary" TEXT NOT NULL, "before" TEXT, "after" TEXT,
-                "undone" INTEGER NOT NULL DEFAULT 0);
+                "undone" INTEGER NOT NULL DEFAULT 0, "batch" INTEGER);
             """)
+        // 0.1 journals have no batch column: add it, nullable, once.
+        let journalColumns = try db.query("PRAGMA table_info(\"_store_journal\")").compactMap { row -> String? in
+            if case .text(let name) = row["name"] { return name }
+            return nil
+        }
+        if !journalColumns.contains("batch") {
+            try db.exec("ALTER TABLE \"_store_journal\" ADD COLUMN \"batch\" INTEGER")
+        }
     }
 
     // MARK: Schemas
@@ -67,6 +85,9 @@ public final class RecordStore {
         schema.version = 1
         if try existingSchema(schema.name) != nil {
             throw .invalidSchema("\(schema.name) already exists — change it with migrate")
+        }
+        for field in schema.fields where field.isLink {
+            try checkTarget(of: field, from: schema)
         }
         let stamp = timestamp()
         try db.transaction { () throws(RecordStoreError) in
@@ -118,26 +139,83 @@ public final class RecordStore {
 
     /// Adds many records in one transaction: all of them, or — if any does
     /// not fit — none, with every problem listed.
+    ///
+    /// One write: `undo` takes the whole batch back out.
     @discardableResult
     public func addAll(_ batch: [(line: Int, value: [String: JSONValue])], to collection: String,
                        provenance: Provenance = Provenance(), allowDuplicate: Bool = false) throws(RecordStoreError) -> [Record] {
+        try addAll(labelled: batch.map { (String($0.line), $0.value) }, to: collection, provenance: provenance, allowDuplicate: allowDuplicate)
+    }
+
+    /// ``addAll(_:to:provenance:allowDuplicate:)`` with each record named
+    /// by a label of its own — its key, for a keyed import — in the problems.
+    @discardableResult
+    public func addAll(labelled batch: [(label: String, value: [String: JSONValue])], to collection: String,
+                       provenance: Provenance = Provenance(), allowDuplicate: Bool = false) throws(RecordStoreError) -> [Record] {
         let schema = try schema(named: collection)
         return try db.transaction { () throws(RecordStoreError) -> [Record] in
-            // Every record of a batch shares its source, so the source is
-            // checked once — the batch is the duplicate, not its second row.
-            if !allowDuplicate { try checkSource(provenance, in: schema) }
-            var added: [Record] = []
-            var problems: [String] = []
-            for (line, values) in batch {
-                do throws(RecordStoreError) {
-                    added.append(try insert(values, into: schema, provenance: provenance, checkSource: false))
-                } catch {
-                    problems.append("record \(line): \(error.message)")
-                    if problems.count >= 25 { problems.append("… and possibly more"); break }
+            try inBatch { () throws(RecordStoreError) -> [Record] in
+                // Every record of a batch shares its source, so the source is
+                // checked once — the batch is the duplicate, not its second row.
+                if !allowDuplicate { try checkSource(provenance, in: schema) }
+                var added: [Record] = []
+                var problems: [String] = []
+                for (label, values) in batch {
+                    do throws(RecordStoreError) {
+                        added.append(try insert(values, into: schema, provenance: provenance, checkSource: false))
+                    } catch {
+                        problems.append("record \(label): \(error.message)")
+                        if problems.count >= 25 { problems.append("… and possibly more"); break }
+                    }
                 }
+                if !problems.isEmpty { throw .invalidRecords(problems) }
+                return added
             }
-            if !problems.isEmpty { throw .invalidRecords(problems) }
-            return added
+        }
+    }
+
+    /// Brings a keyed collection up to date from a catalogue: a record whose
+    /// key is new is added, one whose key exists has the fields given set
+    /// (fields left out are kept), and one already as given is left alone.
+    /// All or nothing, and one write for undo. Records are never removed.
+    @discardableResult
+    public func merge(_ batch: [(label: String, value: [String: JSONValue])], into collection: String,
+                      provenance: Provenance = Provenance()) throws(RecordStoreError) -> MergeResult {
+        let schema = try schema(named: collection)
+        guard let key = schema.key else { throw .invalidQuery("\(collection) has no key, so there is nothing to merge records by") }
+        return try db.transaction { () throws(RecordStoreError) -> MergeResult in
+            try inBatch { () throws(RecordStoreError) -> MergeResult in
+                var result = MergeResult(added: [], updated: [], unchanged: [])
+                var problems: [String] = []
+                for (label, values) in batch {
+                    do throws(RecordStoreError) {
+                        guard case .string(let name)? = values[key] else { throw .invalidValue(field: key, reason: "is required") }
+                        let existing = try db.query("SELECT * FROM \(SQLText.quoted(schema.name)) WHERE lower(\(SQLText.quoted(key))) = lower(?) LIMIT 1",
+                                                    [.text(name.trimmingCharacters(in: .whitespaces))]).first
+                        guard let existing else {
+                            result.added.append(try insert(values, into: schema, provenance: provenance, checkSource: false))
+                            continue
+                        }
+                        try rejectUnknown(values.keys, in: schema)
+                        var changed: [String: JSONValue] = [:]
+                        for field in schema.fields {
+                            guard let value = values[field.name] else { continue }
+                            let given = try coerced(field.name == key ? try keyValue(value, field) : value, field)
+                            if given != SchemaRules.columns(of: field).map({ existing[$0] }) { changed[field.name] = value }
+                        }
+                        if changed.isEmpty {
+                            result.unchanged.append(label)
+                        } else {
+                            result.updated.append(try applyUpdate(id(of: existing), in: schema, with: changed, adding: [:], removing: [:]))
+                        }
+                    } catch {
+                        problems.append("record \(label): \(error.message)")
+                        if problems.count >= 25 { problems.append("… and possibly more"); break }
+                    }
+                }
+                if !problems.isEmpty { throw .invalidRecords(problems) }
+                return result
+            }
         }
     }
 
@@ -146,6 +224,12 @@ public final class RecordStore {
         let schema = try schema(named: collection)
         guard let row = try row(id, in: schema) else { throw .recordNotFound(collection: collection, id: id) }
         return record(from: row, schema: schema)
+    }
+
+    /// One record by id or key: `"bloating"`, `"12"`, `"#12"`.
+    public func get(_ reference: String, from collection: String) throws(RecordStoreError) -> Record {
+        let schema = try schema(named: collection)
+        return try get(try resolve(reference, in: schema), from: collection)
     }
 
     /// Changes some fields of a record. A field set to null is cleared,
@@ -163,56 +247,44 @@ public final class RecordStore {
                        adding: [String: [String]], removing: [String: [String]]) throws(RecordStoreError) -> Record {
         let schema = try schema(named: collection)
         return try db.transaction { () throws(RecordStoreError) -> Record in
-            guard let before = try row(id, in: schema) else { throw .recordNotFound(collection: collection, id: id) }
-            var values = values
-            let current = record(from: before, schema: schema).values
-            for name in Set(adding.keys).union(removing.keys).sorted() {
-                guard let field = schema.fields.first(where: { $0.name == name }) else {
-                    throw .unknownField(collection: schema.name, field: name)
-                }
-                guard field.type == .tags else { throw .invalidValue(field: name, reason: "is \(field.type.rawValue) — only tags are added to or removed from") }
-                guard values[name] == nil else { throw .invalidValue(field: name, reason: "is both set and added to; do one") }
-                let have: [String] = if case .array(let items) = current[name] ?? .null {
-                    items.compactMap { if case .string(let s) = $0 { s } else { nil } }
-                } else { [] }
-                values[name] = .array(TagEdits.applied(have, adding: adding[name] ?? [], removing: removing[name] ?? []).map(JSONValue.string))
-            }
-            try rejectUnknown(values.keys, in: schema)
-            guard !values.isEmpty else { throw .invalidValue(field: "", reason: "nothing to change") }
-            var sets: [String] = []
-            var binds: [Database.Value] = []
-            for field in schema.fields {
-                guard let value = values[field.name] else { continue }
-                if value == .null && field.required { throw .invalidValue(field: field.name, reason: "is required") }
-                let columns = try coerced(value, field)
-                if field.unique, value != .null { try checkUnique(field, columns, in: schema, excluding: id) }
-                for (name, column) in zip(SchemaRules.columns(of: field), columns) {
-                    sets.append("\(SQLText.quoted(name)) = ?")
-                    binds.append(column)
-                }
-            }
-            sets.append("\"_updated_at\" = ?")
-            binds.append(.text(timestamp()))
-            try db.run("UPDATE \(SQLText.quoted(schema.name)) SET \(sets.joined(separator: ", ")) WHERE \"id\" = ?", binds + [.int(id)])
-            guard let after = try row(id, in: schema) else { throw .recordNotFound(collection: collection, id: id) }
-            try journal(schema.name, .update, recordID: id,
-                        summary: "updated #\(id) (\(values.keys.sorted().joined(separator: ", ")))",
-                        before: RowSnapshot.text(before), after: RowSnapshot.text(after))
-            return record(from: after, schema: schema)
+            try applyUpdate(id, in: schema, with: values, adding: adding, removing: removing)
         }
     }
 
-    /// Removes a record. Undo puts it back with the same id.
+    /// ``update(_:in:with:adding:removing:)`` naming the record by id or key.
     @discardableResult
-    public func delete(_ id: Int64, from collection: String) throws(RecordStoreError) -> Record {
+    public func update(_ reference: String, in collection: String, with values: [String: JSONValue],
+                       adding: [String: [String]] = [:], removing: [String: [String]] = [:]) throws(RecordStoreError) -> Record {
+        let schema = try schema(named: collection)
+        return try update(try resolve(reference, in: schema), in: collection, with: values, adding: adding, removing: removing)
+    }
+
+    /// Removes a record. Undo puts it back with the same id.
+    ///
+    /// A record other records link to is refused, naming them. With `force`
+    /// those links are taken out first — the item leaves a list of links, an
+    /// optional single link is cleared — all in one write that one undo
+    /// reverses; a required link still refuses, since nothing can stand in.
+    @discardableResult
+    public func delete(_ id: Int64, from collection: String, force: Bool = false) throws(RecordStoreError) -> Record {
         let schema = try schema(named: collection)
         return try db.transaction { () throws(RecordStoreError) -> Record in
-            guard let before = try row(id, in: schema) else { throw .recordNotFound(collection: collection, id: id) }
-            try db.run("DELETE FROM \(SQLText.quoted(schema.name)) WHERE \"id\" = ?", [.int(id)])
-            try journal(schema.name, .delete, recordID: id, summary: "deleted #\(id)",
-                        before: RowSnapshot.text(before), after: nil)
-            return record(from: before, schema: schema)
+            try inBatch { () throws(RecordStoreError) -> Record in
+                guard let before = try row(id, in: schema) else { throw .recordNotFound(collection: collection, id: id) }
+                try enforceLinks(schema, before: before, after: nil, force: force)
+                try db.run("DELETE FROM \(SQLText.quoted(schema.name)) WHERE \"id\" = ?", [.int(id)])
+                try journal(schema.name, .delete, recordID: id, summary: "deleted \(label(before, schema))",
+                            before: RowSnapshot.text(before), after: nil)
+                return record(from: before, schema: schema)
+            }
         }
+    }
+
+    /// ``delete(_:from:force:)`` naming the record by id or key.
+    @discardableResult
+    public func delete(_ reference: String, from collection: String, force: Bool = false) throws(RecordStoreError) -> Record {
+        let schema = try schema(named: collection)
+        return try delete(try resolve(reference, in: schema), from: collection, force: force)
     }
 
     // MARK: Internals shared with the extensions
@@ -245,14 +317,34 @@ public final class RecordStore {
 
     func journal(_ collection: String, _ action: JournalAction, recordID: Int64?, summary: String,
                  before: String?, after: String?) throws(RecordStoreError) {
+        var batch: Database.Value = .null
+        if batching, let first = batchID {
+            // The second entry of a batch labels the first, so a write on
+            // its own never carries a batch.
+            if !batchLabelled {
+                try db.run("UPDATE \"_store_journal\" SET \"batch\" = ? WHERE \"id\" = ?", [.int(first), .int(first)])
+                batchLabelled = true
+            }
+            batch = .int(first)
+        }
         try db.run("""
-            INSERT INTO "_store_journal" ("at", "collection", "action", "record_id", "summary", "before", "after")
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO "_store_journal" ("at", "collection", "action", "record_id", "summary", "before", "after", "batch")
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, [.text(timestamp()), .text(collection), .text(action.rawValue), recordID.map(Database.Value.int) ?? .null,
-                  .text(summary), before.map(Database.Value.text) ?? .null, after.map(Database.Value.text) ?? .null])
+                  .text(summary), before.map(Database.Value.text) ?? .null, after.map(Database.Value.text) ?? .null, batch])
+        if batching, batchID == nil { batchID = db.lastInsertID }
+    }
+
+    /// Runs `body` with every journal entry it writes in one batch.
+    func inBatch<T>(_ body: () throws(RecordStoreError) -> T) throws(RecordStoreError) -> T {
+        let outer = batching
+        if !outer { batching = true; batchID = nil; batchLabelled = false }
+        defer { if !outer { batching = false; batchID = nil; batchLabelled = false } }
+        return try body()
     }
 
     func coerced(_ value: JSONValue, _ field: Field) throws(RecordStoreError) -> [Database.Value] {
+        if field.isLink { return try linkColumns(value, field) }
         do throws(CoercionFailure) {
             return try ValueCoercion.columns(for: value, field: field, now: now(), timeZone: timeZone)
         } catch {
@@ -286,9 +378,10 @@ public final class RecordStore {
         for field in schema.fields {
             var value = values[field.name] ?? .null
             if value == .null, let fallback = field.default { value = fallback }
+            if field.name == schema.key { value = try keyValue(value, field) }
             if value == .null && field.required { throw .invalidValue(field: field.name, reason: "is required") }
             let columns = try coerced(value, field)
-            if field.unique, value != .null { try checkUnique(field, columns, in: schema, excluding: nil) }
+            if field.unique, value != .null { try checkUnique(field, columns, in: schema, excluding: nil, key: field.name == schema.key) }
             names += SchemaRules.columns(of: field)
             binds += columns
         }
@@ -298,18 +391,80 @@ public final class RecordStore {
         try db.run("INSERT INTO \(SQLText.quoted(schema.name)) (\(names.map(SQLText.quoted).joined(separator: ", "))) VALUES (\(names.map { _ in "?" }.joined(separator: ", ")))", binds)
         let id = db.lastInsertID
         guard let after = try row(id, in: schema) else { throw .storage("the insert did not stick") }
-        try journal(schema.name, .insert, recordID: id, summary: "added #\(id)", before: nil, after: RowSnapshot.text(after))
+        try journal(schema.name, .insert, recordID: id, summary: "added \(label(after, schema))", before: nil, after: RowSnapshot.text(after))
         return record(from: after, schema: schema)
     }
 
-    private func checkUnique(_ field: Field, _ columns: [Database.Value], in schema: Schema, excluding id: Int64?) throws(RecordStoreError) {
+    /// Keys are unique without regard to case: `Dairy` and `dairy` are one.
+    func checkUnique(_ field: Field, _ columns: [Database.Value], in schema: Schema, excluding id: Int64?, key: Bool = false) throws(RecordStoreError) {
         let names = SchemaRules.columns(of: field)
-        var sql = "SELECT \"id\" FROM \(SQLText.quoted(schema.name)) WHERE " + names.map { "\(SQLText.quoted($0)) = ?" }.joined(separator: " AND ")
+        var sql = "SELECT \"id\" FROM \(SQLText.quoted(schema.name)) WHERE "
+            + names.map { key ? "lower(\(SQLText.quoted($0))) = lower(?)" : "\(SQLText.quoted($0)) = ?" }.joined(separator: " AND ")
         var binds = columns
         if let id { sql += " AND \"id\" != ?"; binds.append(.int(id)) }
         if let match = try db.query(sql + " LIMIT 1", binds).first, case .int(let other) = match["id"] {
-            throw .duplicate("\(field.name) must be unique and #\(other) already has that value")
+            let name = try row(other, in: schema).map { label($0, schema) } ?? "#\(other)"
+            throw .duplicate("\(field.name) must be unique and \(name == "#\(other)" ? name : "\(name) (#\(other))") already has that value")
         }
+    }
+
+    /// A key as stored: trimmed text that cannot be mistaken for an id.
+    func keyValue(_ value: JSONValue, _ field: Field) throws(RecordStoreError) -> JSONValue {
+        switch value {
+        case .null: return .null
+        case .string(let s):
+            let trimmed = s.trimmingCharacters(in: .whitespaces)
+            if let problem = SchemaRules.keyProblem(trimmed) { throw .invalidValue(field: field.name, reason: problem) }
+            return .string(trimmed)
+        default:
+            throw .invalidValue(field: field.name, reason: "a key is text, e.g. \"dairy\"")
+        }
+    }
+
+    // MARK: Updating
+
+    /// The body of an update, inside the caller's transaction.
+    func applyUpdate(_ id: Int64, in schema: Schema, with values: [String: JSONValue],
+                     adding: [String: [String]], removing: [String: [String]]) throws(RecordStoreError) -> Record {
+        guard let before = try row(id, in: schema) else { throw .recordNotFound(collection: schema.name, id: id) }
+        var values = values
+        let current = record(from: before, schema: schema).values
+        for name in Set(adding.keys).union(removing.keys).sorted() {
+            guard let field = schema.field(name) else {
+                throw .unknownField(collection: schema.name, field: name)
+            }
+            guard field.isList else {
+                throw .invalidValue(field: name, reason: "is \(field.type.rawValue) — only tags and refs are added to or removed from")
+            }
+            guard values[name] == nil else { throw .invalidValue(field: name, reason: "is both set and added to; do one") }
+            let have: [String] = if case .array(let items) = current[name] ?? .null { items.map(ValueDisplay.text) } else { [] }
+            values[name] = .array(TagEdits.applied(have, adding: adding[name] ?? [], removing: removing[name] ?? []).map(JSONValue.string))
+        }
+        try rejectUnknown(values.keys, in: schema)
+        guard !values.isEmpty else { throw .invalidValue(field: "", reason: "nothing to change") }
+        var sets: [String] = []
+        var binds: [Database.Value] = []
+        for field in schema.fields {
+            guard var value = values[field.name] else { continue }
+            if field.name == schema.key { value = try keyValue(value, field) }
+            if value == .null && field.required { throw .invalidValue(field: field.name, reason: "is required") }
+            let columns = try coerced(value, field)
+            if field.unique, value != .null { try checkUnique(field, columns, in: schema, excluding: id, key: field.name == schema.key) }
+            for (name, column) in zip(SchemaRules.columns(of: field), columns) {
+                sets.append("\(SQLText.quoted(name)) = ?")
+                binds.append(column)
+            }
+        }
+        sets.append("\"_updated_at\" = ?")
+        binds.append(.text(timestamp()))
+        try db.run("UPDATE \(SQLText.quoted(schema.name)) SET \(sets.joined(separator: ", ")) WHERE \"id\" = ?", binds + [.int(id)])
+        guard let after = try row(id, in: schema) else { throw .recordNotFound(collection: schema.name, id: id) }
+        // A key that others link to cannot change under them.
+        try enforceLinks(schema, before: before, after: after, force: false)
+        try journal(schema.name, .update, recordID: id,
+                    summary: "updated \(label(after, schema)) (\(values.keys.sorted().joined(separator: ", ")))",
+                    before: RowSnapshot.text(before), after: RowSnapshot.text(after))
+        return record(from: after, schema: schema)
     }
 }
 

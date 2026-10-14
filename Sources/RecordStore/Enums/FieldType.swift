@@ -8,7 +8,8 @@
 import Foundation
 
 /// What a field holds. Small on purpose: these cover receipts, workouts,
-/// mileage, habits and reading lists without a type system to maintain.
+/// mileage, habits, reading lists and linked catalogues without a type
+/// system to maintain.
 public enum FieldType: String, Codable, Sendable, CaseIterable {
 
     /// Free text.
@@ -38,4 +39,17 @@ public enum FieldType: String, Codable, Sendable, CaseIterable {
 
     /// A list of short strings.
     case tags
+
+    /// A link to one record of another collection (its ``Field/target``):
+    /// stored as that record's key, or its id when the target has no key.
+    /// A value that names no record is refused.
+    case ref
+
+    /// Links to several records of another collection, stored like tags:
+    /// a JSON array of keys (or ids).
+    case refs
+
+    /// A pair of numbers, low to high — `[0.5, 3]`, `"0.5..3"` — stored as
+    /// two REAL columns (`<field>` and `<field>__max`).
+    case range
 }

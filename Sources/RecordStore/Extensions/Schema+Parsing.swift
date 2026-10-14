@@ -53,3 +53,14 @@ public extension Money {
     /// The amount as decimal text: "23.40".
     var amountText: String { MoneyParsing.amountText(self) }
 }
+
+public extension Schema {
+
+    /// Records from a file keyed by name — `{"symptoms": {"bloating": {…}}}`
+    /// or `{"bloating": {…}}` — each member a record whose key is its name.
+    /// Nil when `object` reads as one plain record instead. `under` names the
+    /// member holding the records when the file has several maps.
+    func keyedRecords(in object: [String: JSONValue], under: String? = nil) throws(RecordStoreError) -> [(label: String, value: [String: JSONValue])]? {
+        try KeyedRecords.records(object, schema: self, under: under)
+    }
+}

@@ -28,7 +28,13 @@ public struct JournalEntry: Sendable, Equatable {
     /// Whether it has been undone. An undone entry cannot be undone again.
     public var undone: Bool
 
-    public init(id: Int64, at: String, collection: String, action: JournalAction, recordID: Int64?, summary: String, undone: Bool) {
+    /// Entries written by one operation — an import, a forced delete and
+    /// the links it removed — share a batch (the first entry's id), and
+    /// undo reverses the whole batch. `nil` for a write on its own.
+    public var batch: Int64?
+
+    public init(id: Int64, at: String, collection: String, action: JournalAction, recordID: Int64?, summary: String, undone: Bool,
+                batch: Int64? = nil) {
         self.id = id
         self.at = at
         self.collection = collection
@@ -36,5 +42,6 @@ public struct JournalEntry: Sendable, Equatable {
         self.recordID = recordID
         self.summary = summary
         self.undone = undone
+        self.batch = batch
     }
 }

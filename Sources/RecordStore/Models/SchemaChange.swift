@@ -18,4 +18,14 @@ public enum SchemaChange: Sendable, Equatable {
 
     /// Removes a field and its values. Undo puts them back.
     case dropField(String)
+
+    /// Makes a text field the collection's key (every record must have a
+    /// distinct one), or — with `nil` — stops naming records by key.
+    case setKey(String?)
+
+    /// Saves a report spec with the collection, replacing one of the same name.
+    case saveReport(ReportSpec)
+
+    /// Removes a saved report spec.
+    case removeReport(String)
 }

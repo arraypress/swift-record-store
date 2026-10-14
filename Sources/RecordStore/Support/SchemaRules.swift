@@ -20,6 +20,9 @@ enum SchemaRules {
     /// The suffix of a money field's currency column.
     static let currencySuffix = "__currency"
 
+    /// The suffix of a range field's upper-bound column.
+    static let rangeSuffix = "__max"
+
     /// Lowercase letters, digits and underscores, starting with a letter; no
     /// double underscore (that is how a money field's currency column is named).
     static func isIdentifier(_ name: String) -> Bool {
@@ -41,7 +44,44 @@ enum SchemaRules {
             guard seen.insert(checked.name).inserted else { throw .invalidSchema("field \"\(checked.name)\" appears twice") }
             out.fields.append(checked)
         }
+        if let key = schema.key {
+            guard let index = out.fields.firstIndex(where: { $0.name == key }) else {
+                throw .invalidSchema("the key \"\(key)\" is not one of the fields")
+            }
+            out.fields[index] = try keyed(out.fields[index])
+        }
+        var names = Set<String>()
+        for report in schema.reports ?? [] {
+            guard let name = report.name, isIdentifier(name) else {
+                throw .invalidSchema("a saved report needs a name: lowercase letters, digits and single underscores")
+            }
+            guard names.insert(name).inserted else { throw .invalidSchema("report \"\(name)\" appears twice") }
+        }
         return out
+    }
+
+    /// A field made fit to be the key: text, required, unique.
+    static func keyed(_ field: Field) throws(RecordStoreError) -> Field {
+        guard field.type == .text else {
+            throw .invalidSchema("the key \"\(field.name)\" must be a text field (it is \(field.type.rawValue))")
+        }
+        guard field.default == nil || field.default == .null else {
+            throw .invalidSchema("the key \"\(field.name)\" cannot have a default — every record needs its own")
+        }
+        var field = field
+        field.required = true
+        field.unique = true
+        return field
+    }
+
+    /// Why `text` cannot name a record, or nil when it can. A key that is a
+    /// bare number would read as an id; one starting with `#` likewise.
+    static func keyProblem(_ text: String) -> String? {
+        if text.isEmpty { return "a key cannot be empty" }
+        if text.hasPrefix("#") { return "a key cannot start with # (that names an id)" }
+        if text.allSatisfy(\.isNumber) { return "a key cannot be a bare number — it would read as an id" }
+        if text.contains(",") { return "a key cannot contain a comma — lists of keys are comma-separated" }
+        return nil
     }
 
     /// Validates one field.
@@ -60,12 +100,24 @@ enum SchemaRules {
         } else if field.choices != nil {
             throw .invalidSchema("\"choices\" only applies to choice fields (\"\(field.name)\" is \(field.type.rawValue))")
         }
+        if field.isLink {
+            guard let target = field.target?.trimmingCharacters(in: .whitespaces), isIdentifier(target) else {
+                throw .invalidSchema("link field \"\(field.name)\" needs the collection it links to: \(field.type.rawValue)(collection)")
+            }
+            field.target = target
+            if field.unique { throw .invalidSchema("link field \"\(field.name)\" cannot be unique") }
+        } else if field.target != nil {
+            throw .invalidSchema("\"target\" only applies to ref and refs fields (\"\(field.name)\" is \(field.type.rawValue))")
+        }
+        if field.unique, [.tags, .range].contains(field.type) {
+            throw .invalidSchema("a \(field.type.rawValue) field cannot be unique")
+        }
         if let currency = field.currency {
             guard field.type == .money else { throw .invalidSchema("\"currency\" only applies to money fields") }
             guard Currencies.isKnown(currency.uppercased()) else { throw .invalidSchema("\"\(currency)\" is not an ISO 4217 currency") }
             field.currency = currency.uppercased()
         }
-        if let value = field.default, value != .null {
+        if let value = field.default, value != .null, !field.isLink {
             do {
                 _ = try ValueCoercion.columns(for: value, field: field, now: Date(), timeZone: .current)
             } catch {
@@ -77,7 +129,11 @@ enum SchemaRules {
 
     /// The column names a field occupies.
     static func columns(of field: Field) -> [String] {
-        field.type == .money ? [field.name, field.name + currencySuffix] : [field.name]
+        switch field.type {
+        case .money: return [field.name, field.name + currencySuffix]
+        case .range: return [field.name, field.name + rangeSuffix]
+        default: return [field.name]
+        }
     }
 
     /// The SQL declaration of a field's columns.
@@ -87,14 +143,17 @@ enum SchemaRules {
         case .number: type = "REAL"
         case .integer, .bool: type = "INTEGER"
         case .money: return ["\(SQLText.quoted(field.name)) INTEGER", "\(SQLText.quoted(field.name + currencySuffix)) TEXT"]
-        case .text, .date, .datetime, .choice, .tags: type = "TEXT"
+        case .range: return ["\(SQLText.quoted(field.name)) REAL", "\(SQLText.quoted(field.name + rangeSuffix)) REAL"]
+        // No affinity: a key stays text and an id stays an integer.
+        case .ref: return [SQLText.quoted(field.name)]
+        case .text, .date, .datetime, .choice, .tags, .refs: type = "TEXT"
         }
         return ["\(SQLText.quoted(field.name)) \(type)"]
     }
 
     /// Reads the field shorthand used on the command line:
     /// `name:type`, `name:type!` (required), `name:money(GBP)`,
-    /// `name:choice(a|b|c)`, `name:type=default`.
+    /// `name:choice(a|b|c)`, `name:ref(collection)`, `name:type=default`.
     static func field(fromSpec spec: String) throws(RecordStoreError) -> Field {
         guard let m = spec.trimmingCharacters(in: .whitespaces).wholeMatch(of: /([a-z][a-z0-9_]*):([a-z]+)(?:\(([^)]*)\))?(!)?(?:=(.*))?/) else {
             throw .invalidSchema("\"\(spec)\" is not a field spec — write name:type, e.g. total:money(GBP)! or category:choice(food|fuel)")
@@ -112,6 +171,7 @@ enum SchemaRules {
                 field.choices = argument.split(separator: separator)
                     .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
             case .money: field.currency = argument
+            case .ref, .refs: field.target = argument
             default: throw .invalidSchema("\(type.rawValue) takes no (…) argument")
             }
         }

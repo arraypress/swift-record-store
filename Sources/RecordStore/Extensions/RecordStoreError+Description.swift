@@ -23,6 +23,8 @@ extension RecordStoreError: LocalizedError {
         case .unreadableJSON(let reason): return "not JSON: \(reason)"
         case .duplicate(let reason): return "duplicate: \(reason)"
         case .recordNotFound(let collection, let id): return "\(collection) has no record #\(id)"
+        case .keyNotFound(let collection, let key): return "\(collection) has no record \"\(key)\""
+        case .linked(let reason): return reason
         case .cannotUndo(let reason): return "cannot undo: \(reason)"
         case .readOnly(let reason): return reason
         case .storage(let reason): return "storage failed: \(reason)"

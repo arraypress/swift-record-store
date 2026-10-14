@@ -16,7 +16,9 @@ let package = Package(
     ],
     targets: [
         .target(name: "RecordStore"),
-        .testTarget(name: "RecordStoreTests", dependencies: ["RecordStore"]),
+        // Fixtures/v0.1.2.sqlite was written by store 0.1.1 over this library's
+        // 0.1.2: every later version must open it and keep working.
+        .testTarget(name: "RecordStoreTests", dependencies: ["RecordStore"], resources: [.copy("Fixtures")]),
     ]
 )
 

@@ -9,11 +9,12 @@ import Foundation
 
 /// Reads the `field op value` filters the command line uses:
 /// `total > 20 GBP`, `category = groceries`, `tags ~ work`,
-/// `shop in Tesco, Aldi`, `notes = null`.
+/// `shop in Tesco, Aldi`, `notes = null` — and through links,
+/// `category.label = Gut`.
 enum FilterParsing {
 
     static func parse(_ text: String) throws(RecordStoreError) -> Filter {
-        let pattern = /^\s*([a-z_][a-z0-9_]*)\s*(!=|<=|>=|==|=|<|>|~|\s+[iI][nN]\s+)\s*(.*?)\s*$/
+        let pattern = /^\s*([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)*)\s*(!=|<=|>=|==|=|<|>|~|\s+[iI][nN]\s+)\s*(.*?)\s*$/
         guard let m = text.wholeMatch(of: pattern) else {
             throw .invalidQuery("\"\(text)\" is not a filter — write field op value, e.g. \"total > 20 GBP\" (ops: = != < <= > >= ~ in)")
         }

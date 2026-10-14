@@ -22,10 +22,22 @@ public struct Schema: Codable, Sendable, Equatable {
     /// Starts at 1 and goes up with every migration.
     public var version: Int
 
-    public init(name: String, fields: [Field], description: String? = nil, version: Int = 1) {
+    /// The field whose text names a record — `bloating`, `dairy` — so that
+    /// get, update, delete and links can use it instead of the id. Required,
+    /// unique (without regard to case) and never a bare number. `nil` (every
+    /// database written before 0.2) means records are named by id alone.
+    public var key: String?
+
+    /// Report specs saved with the collection, by name.
+    public var reports: [ReportSpec]?
+
+    public init(name: String, fields: [Field], description: String? = nil, version: Int = 1,
+                key: String? = nil, reports: [ReportSpec]? = nil) {
         self.name = name
         self.fields = fields
         self.description = description
         self.version = version
+        self.key = key
+        self.reports = reports
     }
 }

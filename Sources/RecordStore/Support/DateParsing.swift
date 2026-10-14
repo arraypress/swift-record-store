@@ -95,6 +95,15 @@ enum DateParsing {
         return utc(instant)
     }
 
+    /// The instant a stored datetime (`YYYY-MM-DDTHH:MM:SSZ`) names.
+    static func instant(_ stored: String) -> Date? {
+        guard let m = stored.wholeMatch(of: /(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z/) else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        return calendar.date(from: DateComponents(year: Int(m.1), month: Int(m.2), day: Int(m.3),
+                                                  hour: Int(m.4), minute: Int(m.5), second: Int(m.6)))
+    }
+
     /// `YYYY-MM-DDTHH:MM:SSZ` for an instant.
     static func utc(_ instant: Date) -> String {
         var calendar = Calendar(identifier: .gregorian)

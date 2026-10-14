@@ -17,7 +17,7 @@ enum ValueCoercion {
     /// ``SchemaRules/columns(of:)``.
     static func columns(for value: JSONValue, field: Field, now: Date, timeZone: TimeZone) throws(CoercionFailure) -> [Database.Value] {
         if value == .null {
-            return field.type == .money ? [.null, .null] : [.null]
+            return [Database.Value](repeating: .null, count: SchemaRules.columns(of: field).count)
         }
         switch field.type {
         case .text:
@@ -88,7 +88,72 @@ enum ValueCoercion {
             var seen = Set<String>()
             tags = tags.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && seen.insert($0.lowercased()).inserted }
             return [.text(JSONCoding.text(.array(tags.map(JSONValue.string))))]
+        case .ref:
+            // The shape only; the store resolves it against the target.
+            switch value {
+            case .string(let s): return [.text(s.trimmingCharacters(in: .whitespaces))]
+            case .number(let d) where DecimalMath.isWhole(d): return [.int(Int64(truncating: NSDecimalNumber(decimal: d)))]
+            default: throw .reason("expected a key or an id")
+            }
+        case .refs:
+            return [.text(JSONCoding.text(.array(try linkItems(value))))]
+        case .range:
+            let (low, high) = try range(value)
+            return [.real(NSDecimalNumber(decimal: low).doubleValue), .real(NSDecimalNumber(decimal: high).doubleValue)]
         }
+    }
+
+    /// The items of a list of links, trimmed and without repeats: keys as
+    /// strings, ids as numbers.
+    static func linkItems(_ value: JSONValue) throws(CoercionFailure) -> [JSONValue] {
+        var items: [JSONValue] = []
+        switch value {
+        case .array(let raw):
+            for item in raw {
+                switch item {
+                case .string(let s): items.append(.string(s.trimmingCharacters(in: .whitespaces)))
+                case .number(let d) where DecimalMath.isWhole(d): items.append(.number(d))
+                default: throw .reason("links are keys or ids")
+                }
+            }
+        case .string(let s): items = s.split(separator: ",").map { .string($0.trimmingCharacters(in: .whitespaces)) }
+        case .number(let d) where DecimalMath.isWhole(d): items = [.number(d)]
+        default: throw .reason("expected a list of keys or ids")
+        }
+        var seen = Set<String>()
+        return items.filter { item in
+            let text = ValueDisplay.text(item)
+            return !text.isEmpty && seen.insert(text.lowercased()).inserted
+        }
+    }
+
+    /// A low–high pair: `[0.5, 3]`, `"0.5..3"`, `"0.5 to 3"`, `{"min", "max"}`,
+    /// or one number for both ends.
+    static func range(_ value: JSONValue) throws(CoercionFailure) -> (Decimal, Decimal) {
+        let pair: (Decimal, Decimal)
+        switch value {
+        case .array(let items) where items.count == 2:
+            pair = (try number(items[0]), try number(items[1]))
+        case .object(let o):
+            guard let low = o["min"] ?? o["low"] ?? o["from"], let high = o["max"] ?? o["high"] ?? o["to"] else {
+                throw .reason("a range object has min and max")
+            }
+            pair = (try number(low), try number(high))
+        case .number(let d):
+            pair = (d, d)
+        case .string(let s):
+            let parts = s.components(separatedBy: "..").count == 2 ? s.components(separatedBy: "..") : s.components(separatedBy: " to ")
+            if parts.count == 2 {
+                pair = (try number(.string(parts[0])), try number(.string(parts[1])))
+            } else {
+                let one = try number(.string(s))
+                pair = (one, one)
+            }
+        default:
+            throw .reason("expected a range such as [0.5, 3] or \"0.5..3\"")
+        }
+        guard pair.0 <= pair.1 else { throw .reason("the low end is above the high end") }
+        return pair
     }
 
     /// A field's value read back from its stored columns.
@@ -109,8 +174,13 @@ enum ValueCoercion {
             if case .int(let minor) = value, case .text(let currency) = row[field.name + SchemaRules.currencySuffix] {
                 return MoneyParsing.json(Money(minorUnits: minor, currency: currency))
             }
-        case .tags:
+        case .tags, .refs:
             if case .text(let s) = value, let parsed = try? JSONCoding.parse(s) { return parsed }
+        case .ref:
+            return raw(value)
+        case .range:
+            let high = row[field.name + SchemaRules.rangeSuffix]
+            return .array([raw(value), high == .null ? raw(value) : raw(high)])
         }
         return raw(value)
     }
@@ -131,7 +201,7 @@ enum ValueCoercion {
         Decimal(string: "\(value)", locale: Locale(identifier: "en_US_POSIX")) ?? Decimal(value)
     }
 
-    private static func number(_ value: JSONValue) throws(CoercionFailure) -> Decimal {
+    static func number(_ value: JSONValue) throws(CoercionFailure) -> Decimal {
         switch value {
         case .number(let d): return d
         case .string(let s):

@@ -34,6 +34,9 @@ public struct Field: Codable, Sendable, Equatable {
     /// For ``FieldType/money``: the currency a bare number is in.
     public var currency: String?
 
+    /// For ``FieldType/ref`` and ``FieldType/refs``: the collection linked to.
+    public var target: String?
+
     public init(
         name: String,
         type: FieldType,
@@ -42,7 +45,8 @@ public struct Field: Codable, Sendable, Equatable {
         unique: Bool = false,
         description: String? = nil,
         choices: [String]? = nil,
-        currency: String? = nil
+        currency: String? = nil,
+        target: String? = nil
     ) {
         self.name = name
         self.type = type
@@ -52,5 +56,6 @@ public struct Field: Codable, Sendable, Equatable {
         self.description = description
         self.choices = choices
         self.currency = currency
+        self.target = target
     }
 }

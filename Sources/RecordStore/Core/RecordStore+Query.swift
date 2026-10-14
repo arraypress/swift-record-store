@@ -33,19 +33,30 @@ public extension RecordStore {
     /// Matching records as typed values.
     func records(_ collection: String, _ query: Query = Query()) throws(RecordStoreError) -> [Record] {
         let schema = try schema(named: collection)
-        let clause = try QueryPlanning.whereClause(schema, query, now: now(), timeZone: timeZone)
-        var sql = "SELECT * FROM \(SQLText.quoted(schema.name)) WHERE \(clause.sql) ORDER BY \"id\""
+        let clause = try QueryPlanning.whereClause(schema, query, now: now(), timeZone: timeZone, table: "\"r\"", catalog: try catalog())
+        var sql = "SELECT * FROM \(SQLText.quoted(schema.name)) AS \"r\" WHERE \(clause.sql) ORDER BY \"id\""
         if let limit = query.limit { sql += " LIMIT \(limit)" }
         return try db.query(sql, clause.binds).map { record(from: $0, schema: schema) }
+    }
+
+    /// Matching records of a collection, decoded into an app's own type —
+    /// the struct `store schema NAME --emit swift` writes.
+    func fetch<T: StoredRecord>(_ type: T.Type, _ query: Query = Query()) throws(RecordStoreError) -> [T] {
+        try records(T.collection, query).map { (record: Record) throws(RecordStoreError) -> T in try record.decoded(as: T.self) }
     }
 }
 
 extension RecordStore {
 
+    /// Every schema by name — what paths through links are resolved against.
+    func catalog() throws(RecordStoreError) -> [String: Schema] {
+        Dictionary(try schemas().map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
+    }
+
     // MARK: Listing
 
     func listing(_ schema: Schema, _ query: Query, includeMeta: Bool) throws(RecordStoreError) -> ResultTable {
-        let clause = try QueryPlanning.whereClause(schema, query, now: now(), timeZone: timeZone)
+        let clause = try QueryPlanning.whereClause(schema, query, now: now(), timeZone: timeZone, table: "\"r\"", catalog: try catalog())
         let running = try query.running.map { (name: String) throws(RecordStoreError) -> Field in try numericField(schema, name, purpose: "a running total") }
         var orderSQL = "\"id\""
         if running != nil, query.order.isEmpty {
@@ -60,7 +71,7 @@ extension RecordStore {
             }.joined(separator: ", ") + ", \"id\""
         }
         // A running total needs every earlier row, so the limit applies after it.
-        var sql = "SELECT * FROM \(SQLText.quoted(schema.name)) WHERE \(clause.sql) ORDER BY \(orderSQL)"
+        var sql = "SELECT * FROM \(SQLText.quoted(schema.name)) AS \"r\" WHERE \(clause.sql) ORDER BY \(orderSQL)"
         if let limit = query.limit, running == nil { sql += " LIMIT \(limit)" }
 
         var columns = ["id"] + schema.fields.map(\.name)
@@ -90,49 +101,43 @@ extension RecordStore {
 
     // MARK: Summaries
 
+    /// Groups and aggregates in two steps. The inner query lists each
+    /// matching record once per distinct group it falls in — a list field
+    /// (tags, refs) spreads a record over its items, a path joins what it
+    /// links to — and the outer one aggregates the records themselves, so
+    /// a record is never counted (or summed) twice inside one group.
     func summary(_ schema: Schema, _ query: Query) throws(RecordStoreError) -> ResultTable {
-        let clause = try QueryPlanning.whereClause(schema, query, now: now(), timeZone: timeZone)
+        let catalog = try catalog()
+        let base = "\"r\"", grouped = "\"g\"", table = SQLText.quoted(schema.name)
+        let clause = try QueryPlanning.whereClause(schema, query, now: now(), timeZone: timeZone, table: base, catalog: catalog)
 
-        // Grouping by a tags field counts each record once under every tag it
-        // has: the matching records are filtered first, then spread over
-        // json_each, and every column is read through the record alias so a
-        // field called `type` or `value` never meets json_each's own columns.
-        let tagGroups = query.groupBy.compactMap { grouping -> Field? in
-            guard case .field(let name) = grouping else { return nil }
-            return schema.fields.first { $0.name == name && $0.type == .tags }
-        }
-        if tagGroups.count > 1 { throw .invalidQuery("group by one tags field at a time") }
-        let tagField = tagGroups.first
-        let record = "r", tag = "t"
-        func column(_ name: String) -> String {
-            (tagField == nil ? "" : SQLText.quoted(record) + ".") + SQLText.quoted(name)
-        }
-
-        var selects: [String] = []
-        var groupSQL: [String] = []
+        var joins: [String] = []
+        var keySelects = ["\(base).\"id\" AS \"_rid\""]
+        var groupAliases: [String] = []
         var groupColumns: [String] = []
-        for grouping in query.groupBy {
+        var readers: [(column: String, aliases: [String], field: Field?, spread: Bool)] = []
+        var counter = 0
+        for (index, grouping) in query.groupBy.enumerated() {
             switch grouping {
-            case .field(let name):
-                guard let field = schema.fields.first(where: { $0.name == name }) else {
-                    throw .unknownField(collection: schema.name, field: name)
+            case .field(let path):
+                let key = try LinkPaths.key(schema, path: path, table: base, catalog: catalog, counter: &counter)
+                joins += key.joins
+                var aliases: [String] = []
+                for (n, expression) in key.columns.enumerated() {
+                    let alias = "g_\(index)_\(n)"
+                    keySelects.append("\(expression) AS \(SQLText.quoted(alias))")
+                    groupAliases.append(alias)
+                    aliases.append(alias)
                 }
-                if field.type == .tags {
-                    selects.append("\(SQLText.quoted(tag)).\"value\" AS \(SQLText.quoted("g_\(field.name)"))")
-                    groupSQL.append(SQLText.quoted("g_\(field.name)"))
-                } else {
-                    for (index, name) in SchemaRules.columns(of: field).enumerated() {
-                        let alias = index == 0 ? "g_\(field.name)" : "g_\(field.name)\(SchemaRules.currencySuffix)"
-                        selects.append("\(column(name)) AS \(SQLText.quoted(alias))")
-                        groupSQL.append(SQLText.quoted(alias))
-                    }
-                }
-                groupColumns.append(field.name)
+                groupColumns.append(path)
+                readers.append((path, aliases, key.field, key.spread && key.columns.count == 1 && key.field.isList))
             case .period(let period):
                 let field = try QueryPlanning.dateField(schema, named: query.dateField)
-                selects.append("\(QueryPlanning.periodExpression(field, period, table: tagField == nil ? nil : record)) AS \(SQLText.quoted("g_" + period.rawValue))")
-                groupSQL.append(SQLText.quoted("g_" + period.rawValue))
+                let alias = "g_\(index)_0"
+                keySelects.append("\(QueryPlanning.periodExpression(field, period, table: base)) AS \(SQLText.quoted(alias))")
+                groupAliases.append(alias)
                 groupColumns.append(period.rawValue)
+                readers.append((period.rawValue, [alias], nil, false))
             }
         }
 
@@ -142,9 +147,12 @@ extension RecordStore {
 
         // Money aggregates group by their currency too, so no total ever
         // crosses currencies.
+        var selects = groupAliases.map { "\(grouped).\(SQLText.quoted($0)) AS \(SQLText.quoted($0))" }
+        var currencyGroups: [String] = []
         var moneyFields: [Field] = []
         var resultColumns = groupColumns
         var specs: [(alias: String, column: String, field: Field?, kind: String)] = []
+        func column(_ name: String) -> String { base + "." + SQLText.quoted(name) }
         for aggregate in aggregates {
             switch aggregate {
             case .count:
@@ -166,7 +174,7 @@ extension RecordStore {
                     moneyFields.append(field)
                     let alias = "c_\(field.name)"
                     selects.append("\(column(field.name + SchemaRules.currencySuffix)) AS \(SQLText.quoted(alias))")
-                    groupSQL.append(SQLText.quoted(alias))
+                    currencyGroups.append(SQLText.quoted(alias))
                 }
                 let alias = "a_\(field.name)_\(kind)"
                 selects.append("\(sqlFunction)(\(column(field.name))) AS \(SQLText.quoted(alias))")
@@ -178,40 +186,27 @@ extension RecordStore {
             }
         }
 
-        var sql: String
-        if let tagField {
-            sql = "SELECT \(selects.joined(separator: ", ")) FROM (SELECT * FROM \(SQLText.quoted(schema.name)) WHERE \(clause.sql)) AS \(SQLText.quoted(record)), "
-                + "json_each(\(column(tagField.name))) AS \(SQLText.quoted(tag)) WHERE 1"
-        } else {
-            sql = "SELECT \(selects.joined(separator: ", ")) FROM \(SQLText.quoted(schema.name)) WHERE \(clause.sql)"
-        }
+        let inner = "SELECT DISTINCT \(keySelects.joined(separator: ", ")) FROM \(table) AS \(base) \(joins.joined(separator: " ")) WHERE \(clause.sql)"
+        var sql = "SELECT \(selects.joined(separator: ", ")) FROM (\(inner)) AS \(grouped) JOIN \(table) AS \(base) ON \(base).\"id\" = \(grouped).\"_rid\" WHERE 1"
         // Rows with no currency (an empty money field) are left out of money
         // aggregates rather than forming a currency-less group.
         if !moneyFields.isEmpty {
             sql += " AND " + moneyFields.map { "\(column($0.name + SchemaRules.currencySuffix)) IS NOT NULL" }.joined(separator: " AND ")
         }
-        if !groupSQL.isEmpty { sql += " GROUP BY \(groupSQL.joined(separator: ", ")) ORDER BY \(groupSQL.joined(separator: ", "))" }
+        let allGroups = groupAliases.map(SQLText.quoted) + currencyGroups
+        if !allGroups.isEmpty { sql += " GROUP BY \(allGroups.joined(separator: ", ")) ORDER BY \(allGroups.joined(separator: ", "))" }
 
         var rows: [[String: JSONValue]] = []
         for raw in try db.query(sql, clause.binds) {
             var row: [String: JSONValue] = [:]
-            for grouping in query.groupBy {
-                switch grouping {
-                case .field(let name):
-                    guard let field = schema.fields.first(where: { $0.name == name }) else { continue }
-                    if field.type == .tags {
-                        row[name] = ValueCoercion.raw(raw["g_\(name)"])
-                    } else if field.type == .money {
-                        if case .int(let minor) = raw["g_\(name)"], case .text(let currency) = raw["g_\(name)\(SchemaRules.currencySuffix)"] {
-                            row[name] = MoneyParsing.json(Money(minorUnits: minor, currency: currency))
-                        } else { row[name] = .null }
-                    } else {
-                        let renamed = Database.Row(columns: [name], values: [raw["g_\(name)"]])
-                        row[name] = ValueCoercion.output(renamed, field: field)
-                    }
-                case .period(let period):
-                    row[period.rawValue] = ValueCoercion.raw(raw["g_" + period.rawValue])
+            for reader in readers {
+                let cells = reader.aliases.map { raw[$0] }
+                guard let field = reader.field, !reader.spread else {
+                    row[reader.column] = ValueCoercion.raw(cells.first ?? .null)
+                    continue
                 }
+                let renamed = Database.Row(columns: SchemaRules.columns(of: field), values: cells)
+                row[reader.column] = ValueCoercion.output(renamed, field: field)
             }
             for spec in specs {
                 row[spec.column] = Accumulation.aggregateValue(raw, alias: spec.alias, field: spec.field, kind: spec.kind)
@@ -252,7 +247,7 @@ extension RecordStore {
         guard let field = schema.fields.first(where: { $0.name == name }) else {
             throw .unknownField(collection: schema.name, field: name)
         }
-        guard ![.tags, .bool].contains(field.type) else {
+        guard ![.tags, .bool, .refs, .range].contains(field.type) else {
             throw .invalidQuery("\(name) is \(field.type.rawValue) — it has no minimum or maximum")
         }
         return field

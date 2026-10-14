@@ -37,6 +37,12 @@ public enum RecordStoreError: Error, Sendable, Equatable {
     /// No record with that id.
     case recordNotFound(collection: String, id: Int64)
 
+    /// No record with that key.
+    case keyNotFound(collection: String, key: String)
+
+    /// A write that would leave other records linking to nothing.
+    case linked(String)
+
     /// Nothing to undo, or an entry that can no longer be undone safely.
     case cannotUndo(String)
 
