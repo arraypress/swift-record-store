@@ -152,9 +152,31 @@ public final class RecordStore {
     /// unless it is required.
     @discardableResult
     public func update(_ id: Int64, in collection: String, with values: [String: JSONValue]) throws(RecordStoreError) -> Record {
+        try update(id, in: collection, with: values, adding: [:], removing: [:])
+    }
+
+    /// Changes some fields of a record, and adds or removes tags without
+    /// restating the rest: `adding: ["symptoms": ["stomach pain"]]` keeps the
+    /// symptoms already there. Read and written in one transaction, so the
+    /// journal's before and after are the whole change.
+    public func update(_ id: Int64, in collection: String, with values: [String: JSONValue],
+                       adding: [String: [String]], removing: [String: [String]]) throws(RecordStoreError) -> Record {
         let schema = try schema(named: collection)
         return try db.transaction { () throws(RecordStoreError) -> Record in
             guard let before = try row(id, in: schema) else { throw .recordNotFound(collection: collection, id: id) }
+            var values = values
+            let current = record(from: before, schema: schema).values
+            for name in Set(adding.keys).union(removing.keys).sorted() {
+                guard let field = schema.fields.first(where: { $0.name == name }) else {
+                    throw .unknownField(collection: schema.name, field: name)
+                }
+                guard field.type == .tags else { throw .invalidValue(field: name, reason: "is \(field.type.rawValue) — only tags are added to or removed from") }
+                guard values[name] == nil else { throw .invalidValue(field: name, reason: "is both set and added to; do one") }
+                let have: [String] = if case .array(let items) = current[name] ?? .null {
+                    items.compactMap { if case .string(let s) = $0 { s } else { nil } }
+                } else { [] }
+                values[name] = .array(TagEdits.applied(have, adding: adding[name] ?? [], removing: removing[name] ?? []).map(JSONValue.string))
+            }
             try rejectUnknown(values.keys, in: schema)
             guard !values.isEmpty else { throw .invalidValue(field: "", reason: "nothing to change") }
             var sets: [String] = []

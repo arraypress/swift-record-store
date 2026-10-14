@@ -103,6 +103,21 @@ struct StoreTests {
         #expect(throws: RecordStoreError.unknownCollection("nope")) { try store.get(1, from: "nope") }
     }
 
+    @Test func tagsAreAddedAndRemovedWithoutRestatingThem() throws {
+        let store = try seeded()
+        // Record 3 has tags ["food", "weekly"].
+        let after = try store.update(3, in: "expenses", with: ["shop": .string("Tesco Extra")],
+                                     adding: ["tags": ["receipt lost", "FOOD"]], removing: ["tags": ["weekly"]])
+        #expect(after.values["tags"] == .array([.string("food"), .string("receipt lost")]))
+        #expect(after.values["shop"] == .string("Tesco Extra"))
+        try store.undo()
+        #expect(try store.get(3, from: "expenses").values["tags"] == .array([.string("food"), .string("weekly")]))
+        #expect(throws: RecordStoreError.self) { try store.update(3, in: "expenses", with: [:], adding: ["shop": ["x"]], removing: [:]) }
+        #expect(throws: RecordStoreError.self) {
+            try store.update(3, in: "expenses", with: ["tags": .array([])], adding: ["tags": ["x"]], removing: [:])
+        }
+    }
+
     @Test func defineRefusesARedefinition() throws {
         let store = try makeStore()
         #expect(throws: RecordStoreError.self) { try store.define(Schema(name: "expenses", fields: [Field(name: "a", type: .text)])) }

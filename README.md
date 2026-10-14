@@ -24,8 +24,13 @@ let october = try store.query("expenses", Query(
     aggregates: [.sum("total")],
     groupBy: [.period(.week)]))
 
+// A symptom noticed later, without restating the list (one journalled change):
+try store.update(5, in: "meals", with: ["severity": .number(4)], adding: ["symptoms": ["stomach pain"]], removing: [:])
+
 try store.undo()   // the last write, exactly reversed
 ```
+
+Grouping by a `tags` field counts each record once under every tag it has (`groupBy: [.field("allergens")]`). A summary's order key may name a field with one aggregate (`total` → `total_sum`).
 
 ## Field types
 
@@ -41,7 +46,7 @@ try store.undo()   // the last write, exactly reversed
 | `choice` | TEXT | one of the field's `choices`, any case — stored in the declared spelling |
 | `tags` | TEXT JSON array | an array of strings or `"a, b"`; trimmed, de-duplicated |
 
-Fields take `required`, `default`, `unique`, `description`; `choices` for a choice field, `currency` for a money field. The shorthand `name:type` adds `!` for required, `(GBP)` or `(a|b|c)` for the argument, and `=value` for a default.
+Fields take `required`, `default`, `unique`, `description`; `choices` for a choice field, `currency` for a money field. The shorthand `name:type` adds `!` for required, `(GBP)` or `(a|b|c)` (or `a,b,c` when no option holds a comma) for the argument, and `=value` for a default.
 
 ## What it refuses, and why
 
