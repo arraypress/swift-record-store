@@ -144,8 +144,21 @@ enum QueryPlanning {
     }
 
     /// The SELECT expression that buckets a date field into a period.
-    static func periodExpression(_ field: Field, _ period: Grouping.Period) -> String {
-        let column = SQLText.quoted(field.name)
+    /// A summary's sort key as a result column. A field name stands for its
+    /// one aggregate — `-total` sorts by `total_sum` when that is the only
+    /// `total_…` column; with two (`total_sum`, `total_avg`) it must be named.
+    static func summaryOrdering(_ ordering: Ordering, columns: [String]) throws(RecordStoreError) -> Ordering {
+        if columns.contains(ordering.key) { return ordering }
+        let candidates = columns.filter { $0.hasPrefix(ordering.key + "_") && !$0.hasSuffix("_running") }
+        guard candidates.count == 1 else {
+            let hint = candidates.count > 1 ? "\"\(ordering.key)\" could be \(candidates.joined(separator: " or "))" : "the columns are \(columns.joined(separator: ", "))"
+            throw .invalidQuery("cannot order by \"\(ordering.key)\" — \(hint)")
+        }
+        return Ordering(key: candidates[0], descending: ordering.descending)
+    }
+
+    static func periodExpression(_ field: Field, _ period: Grouping.Period, table: String? = nil) -> String {
+        let column = (table.map { SQLText.quoted($0) + "." } ?? "") + SQLText.quoted(field.name)
         switch period {
         case .day: return "substr(\(column), 1, 10)"
         case .month: return "substr(\(column), 1, 7)"

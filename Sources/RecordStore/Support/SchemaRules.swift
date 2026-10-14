@@ -105,7 +105,12 @@ enum SchemaRules {
         var field = Field(name: String(m.1), type: type, required: m.4 != nil)
         if let argument = m.3.map(String.init) {
             switch type {
-            case .choice: field.choices = argument.split(separator: "|").map { String($0) }
+            // `a|b|c`; `a,b,c` is read the same way when there is no `|` —
+            // it used to become ONE choice that no value ever matched.
+            case .choice:
+                let separator: Character = argument.contains("|") ? "|" : ","
+                field.choices = argument.split(separator: separator)
+                    .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
             case .money: field.currency = argument
             default: throw .invalidSchema("\(type.rawValue) takes no (…) argument")
             }

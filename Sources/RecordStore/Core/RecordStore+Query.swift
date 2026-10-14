@@ -93,6 +93,21 @@ extension RecordStore {
     func summary(_ schema: Schema, _ query: Query) throws(RecordStoreError) -> ResultTable {
         let clause = try QueryPlanning.whereClause(schema, query, now: now(), timeZone: timeZone)
 
+        // Grouping by a tags field counts each record once under every tag it
+        // has: the matching records are filtered first, then spread over
+        // json_each, and every column is read through the record alias so a
+        // field called `type` or `value` never meets json_each's own columns.
+        let tagGroups = query.groupBy.compactMap { grouping -> Field? in
+            guard case .field(let name) = grouping else { return nil }
+            return schema.fields.first { $0.name == name && $0.type == .tags }
+        }
+        if tagGroups.count > 1 { throw .invalidQuery("group by one tags field at a time") }
+        let tagField = tagGroups.first
+        let record = "r", tag = "t"
+        func column(_ name: String) -> String {
+            (tagField == nil ? "" : SQLText.quoted(record) + ".") + SQLText.quoted(name)
+        }
+
         var selects: [String] = []
         var groupSQL: [String] = []
         var groupColumns: [String] = []
@@ -102,16 +117,20 @@ extension RecordStore {
                 guard let field = schema.fields.first(where: { $0.name == name }) else {
                     throw .unknownField(collection: schema.name, field: name)
                 }
-                guard field.type != .tags else { throw .invalidQuery("cannot group by tags") }
-                for (index, column) in SchemaRules.columns(of: field).enumerated() {
-                    let alias = index == 0 ? "g_\(field.name)" : "g_\(field.name)\(SchemaRules.currencySuffix)"
-                    selects.append("\(SQLText.quoted(column)) AS \(SQLText.quoted(alias))")
-                    groupSQL.append(SQLText.quoted(alias))
+                if field.type == .tags {
+                    selects.append("\(SQLText.quoted(tag)).\"value\" AS \(SQLText.quoted("g_\(field.name)"))")
+                    groupSQL.append(SQLText.quoted("g_\(field.name)"))
+                } else {
+                    for (index, name) in SchemaRules.columns(of: field).enumerated() {
+                        let alias = index == 0 ? "g_\(field.name)" : "g_\(field.name)\(SchemaRules.currencySuffix)"
+                        selects.append("\(column(name)) AS \(SQLText.quoted(alias))")
+                        groupSQL.append(SQLText.quoted(alias))
+                    }
                 }
                 groupColumns.append(field.name)
             case .period(let period):
                 let field = try QueryPlanning.dateField(schema, named: query.dateField)
-                selects.append("\(QueryPlanning.periodExpression(field, period)) AS \(SQLText.quoted("g_" + period.rawValue))")
+                selects.append("\(QueryPlanning.periodExpression(field, period, table: tagField == nil ? nil : record)) AS \(SQLText.quoted("g_" + period.rawValue))")
                 groupSQL.append(SQLText.quoted("g_" + period.rawValue))
                 groupColumns.append(period.rawValue)
             }
@@ -146,24 +165,30 @@ extension RecordStore {
                 if field.type == .money, !moneyFields.contains(field) {
                     moneyFields.append(field)
                     let alias = "c_\(field.name)"
-                    selects.append("\(SQLText.quoted(field.name + SchemaRules.currencySuffix)) AS \(SQLText.quoted(alias))")
+                    selects.append("\(column(field.name + SchemaRules.currencySuffix)) AS \(SQLText.quoted(alias))")
                     groupSQL.append(SQLText.quoted(alias))
                 }
                 let alias = "a_\(field.name)_\(kind)"
-                selects.append("\(sqlFunction)(\(SQLText.quoted(field.name))) AS \(SQLText.quoted(alias))")
+                selects.append("\(sqlFunction)(\(column(field.name))) AS \(SQLText.quoted(alias))")
                 if kind == "avg" {
-                    selects.append("COUNT(\(SQLText.quoted(field.name))) AS \(SQLText.quoted(alias + "_n"))")
+                    selects.append("COUNT(\(column(field.name))) AS \(SQLText.quoted(alias + "_n"))")
                 }
                 specs.append((alias, "\(field.name)_\(kind)", field, kind))
                 resultColumns.append("\(field.name)_\(kind)")
             }
         }
 
-        var sql = "SELECT \(selects.joined(separator: ", ")) FROM \(SQLText.quoted(schema.name)) WHERE \(clause.sql)"
+        var sql: String
+        if let tagField {
+            sql = "SELECT \(selects.joined(separator: ", ")) FROM (SELECT * FROM \(SQLText.quoted(schema.name)) WHERE \(clause.sql)) AS \(SQLText.quoted(record)), "
+                + "json_each(\(column(tagField.name))) AS \(SQLText.quoted(tag)) WHERE 1"
+        } else {
+            sql = "SELECT \(selects.joined(separator: ", ")) FROM \(SQLText.quoted(schema.name)) WHERE \(clause.sql)"
+        }
         // Rows with no currency (an empty money field) are left out of money
         // aggregates rather than forming a currency-less group.
         if !moneyFields.isEmpty {
-            sql += " AND " + moneyFields.map { "\(SQLText.quoted($0.name + SchemaRules.currencySuffix)) IS NOT NULL" }.joined(separator: " AND ")
+            sql += " AND " + moneyFields.map { "\(column($0.name + SchemaRules.currencySuffix)) IS NOT NULL" }.joined(separator: " AND ")
         }
         if !groupSQL.isEmpty { sql += " GROUP BY \(groupSQL.joined(separator: ", ")) ORDER BY \(groupSQL.joined(separator: ", "))" }
 
@@ -174,7 +199,9 @@ extension RecordStore {
                 switch grouping {
                 case .field(let name):
                     guard let field = schema.fields.first(where: { $0.name == name }) else { continue }
-                    if field.type == .money {
+                    if field.type == .tags {
+                        row[name] = ValueCoercion.raw(raw["g_\(name)"])
+                    } else if field.type == .money {
                         if case .int(let minor) = raw["g_\(name)"], case .text(let currency) = raw["g_\(name)\(SchemaRules.currencySuffix)"] {
                             row[name] = MoneyParsing.json(Money(minorUnits: minor, currency: currency))
                         } else { row[name] = .null }
@@ -200,10 +227,10 @@ extension RecordStore {
         }
 
         if !query.order.isEmpty {
-            for ordering in query.order where !resultColumns.contains(ordering.key) {
-                throw .invalidQuery("cannot order by \"\(ordering.key)\" — the columns are \(resultColumns.joined(separator: ", "))")
+            let order = try query.order.map { (ordering: Ordering) throws(RecordStoreError) -> Ordering in
+                try QueryPlanning.summaryOrdering(ordering, columns: resultColumns)
             }
-            rows = Accumulation.sorted(rows, by: query.order)
+            rows = Accumulation.sorted(rows, by: order)
         }
         if let limit = query.limit { rows = Array(rows.prefix(limit)) }
         return ResultTable(columns: resultColumns, rows: rows)

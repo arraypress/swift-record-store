@@ -69,6 +69,30 @@ struct QueryTests {
         ])
     }
 
+    @Test func groupedByTagsCountsEachRecordUnderEveryTag() throws {
+        let store = try seeded()
+        let result = try store.query("expenses", Query(aggregates: [.count, .sum("total")], groupBy: [.field("tags")]))
+        #expect(result.columns == ["tags", "count", "total_sum"])
+        let rows = result.rows.map { "\($0["tags"]!.displayText) \($0["count"]!.displayText) \($0["total_sum"]!.displayText)" }
+        // Records with no tags are in no group; record 3 counts under both of its tags.
+        #expect(rows == ["food 2 32.50 GBP", "holiday 1 10.00 EUR", "weekly 1 12.50 GBP"])
+
+        let filtered = try store.query("expenses", Query(filters: ["shop = Tesco"].map(Filter.parse), groupBy: [.field("tags"), .period(.month)]))
+        #expect(filtered.rows.map { "\($0["tags"]!.displayText) \($0["month"]!.displayText) \($0["count"]!.displayText)" }
+                == ["food 2026-09 1", "food 2026-10 1", "weekly 2026-10 1"])
+    }
+
+    @Test func aFieldNameSortsByItsOnlyAggregate() throws {
+        let store = try seeded()
+        let byTotal = try store.query("expenses", Query(filters: ["total > 0 GBP"].map(Filter.parse), aggregates: [.sum("total")],
+                                                        groupBy: [.field("shop")], order: [Ordering(key: "total", descending: true)]))
+        #expect(byTotal.rows.map { $0["shop"]!.displayText } == ["Tesco", "Shell", "Aldi"])
+        #expect(throws: RecordStoreError.self) {
+            try store.query("expenses", Query(aggregates: [.sum("total"), .average("total")], groupBy: [.field("shop")],
+                                              order: [Ordering(key: "total", descending: true)]))
+        }
+    }
+
     @Test func runningTotalsOverRecordsAndOverGroups() throws {
         let store = try seeded()
         let records = try store.query("expenses", Query(running: "total"))

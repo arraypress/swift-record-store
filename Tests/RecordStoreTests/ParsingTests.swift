@@ -112,6 +112,12 @@ struct SchemaParsingTests {
         #expect(schema.fields[3].choices == ["groceries", "fuel", "eating out"])
     }
 
+    @Test func choicesSplitOnCommasWhenThereIsNoBar() throws {
+        // `choice(a,b)` used to be ONE choice "a,b" that no value matched.
+        #expect(try SchemaRules.field(fromSpec: "c:choice(food, travel,bills)").choices == ["food", "travel", "bills"])
+        #expect(try SchemaRules.field(fromSpec: "c:choice(salt, pepper|oil)").choices == ["salt, pepper", "oil"])
+    }
+
     @Test func badSchemasSayWhy() {
         func reason(_ text: String) -> String {
             do { _ = try Schema.parse(text); return "" } catch { return error.message }
