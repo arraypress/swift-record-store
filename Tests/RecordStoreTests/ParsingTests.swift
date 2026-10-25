@@ -54,6 +54,16 @@ struct MoneyParsingTests {
         #expect(try MoneyParsing.parse(.object(["amount": .string("1,000.10"), "currency": .string("EUR")]), defaultCurrency: nil).minorUnits == 100010)
     }
 
+    @Test func negativeAmountsInTheObjectForm() throws {
+        // store writes a refund as {"amount": "-60.00", …}; it must read its own output back.
+        let refund = Money(minorUnits: -6000, currency: "GBP")
+        #expect(try MoneyParsing.parse(MoneyParsing.json(refund), defaultCurrency: nil) == refund)
+        #expect(try MoneyParsing.parse(.object(["amount": .string("−5.50"), "currency": .string("EUR")]), defaultCurrency: nil).minorUnits == -550)
+        #expect(throws: MoneyFailure.malformed("\"-5\" is not an amount")) {
+            try MoneyParsing.parse(.object(["amount": .string("--5"), "currency": .string("GBP")]), defaultCurrency: nil)
+        }
+    }
+
     @Test func amountTextKeepsTheCurrencysDigits() {
         #expect(MoneyParsing.amountText(Money(minorUnits: 2340, currency: "GBP")) == "23.40")
         #expect(MoneyParsing.amountText(Money(minorUnits: -5, currency: "GBP")) == "-0.05")

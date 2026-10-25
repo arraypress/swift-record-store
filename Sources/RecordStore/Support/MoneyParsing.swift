@@ -45,7 +45,7 @@ enum MoneyParsing {
             }
             switch object["amount"] {
             case .number(let amount)?: return try money(amount, currency: currency)
-            case .string(let text)?: return try money(number(text), currency: currency)
+            case .string(let text)?: return try money(signedNumber(text), currency: currency)
             default: throw .malformed("give {\"amount\": …, \"currency\": …}")
             }
         default:
@@ -115,6 +115,14 @@ enum MoneyParsing {
         guard let code = currency ?? defaultCurrency else { throw .noCurrency }
         let amount = try number(body)
         return try money(negative ? -amount : amount, currency: code)
+    }
+
+    /// A number that may carry a sign — "-60.00", "−60.00" — as in the {amount, currency} form store itself writes
+    /// for a refund; without this, store couldn't read back its own negative amounts.
+    static func signedNumber(_ text: String) throws(MoneyFailure) -> Decimal {
+        let body = text.trimmingCharacters(in: .whitespaces)
+        if body.hasPrefix("-") || body.hasPrefix("−") { return -(try number(String(body.dropFirst()))) }
+        return try number(body)
     }
 
     /// The amount part: digits, optional thousands commas, one decimal point.
