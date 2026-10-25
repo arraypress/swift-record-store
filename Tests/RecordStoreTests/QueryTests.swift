@@ -104,6 +104,21 @@ struct QueryTests {
         #expect(monthly.rows.map { $0["total_running"]!.displayText } == ["30.00 GBP", "49.75 GBP"])
     }
 
+    /// A refund is negative money; a running total and a money ordering must carry on through it (both read each
+    /// sum back in the {amount, currency} form, which refused a negative amount before 0.2.2 — the total went null).
+    @Test func runningTotalsAndOrderCarryOnThroughARefund() throws {
+        let store = try seeded()
+        let refund: [String: JSONValue] = ["shop": .string("Tesco"), "total": money("-15.00", "GBP"), "date": .string("2026-10-20"),
+                                           "category": .string("groceries")]
+        try store.addAll([(line: 6, value: refund)], to: "expenses")
+        let daily = try store.query("expenses", Query(filters: [Filter(field: "total", op: .notEqual, value: "10 EUR")],
+                                                      groupBy: [.period(.month)], running: "total"))
+        #expect(daily.rows.map { $0["total_running"]!.displayText } == ["30.00 GBP", "34.75 GBP"], "49.75 less the 15.00 refund")
+        let ordered = try store.query("expenses", Query(filters: [Filter(field: "total", op: .notEqual, value: "10 EUR")],
+                                                        order: [Ordering(key: "total", descending: false)]))
+        #expect(ordered.rows.first?["total"]?.displayText == "-15.00 GBP", "the refund sorts lowest")
+    }
+
     /// Periods are the store's own calendar days: a 20:00 dinner in New York is that day's, though in UTC it is
     /// already the next. The zone is read when the query runs.
     @Test func periodsFollowTheStoresTimeZone() throws {
