@@ -86,7 +86,7 @@ let symptoms = try store.fetch(Symptom.self, Query(filters: [Filter.parse("trigg
 | `integer` | INTEGER | whole numbers |
 | `money` | INTEGER minor units + `<field>__currency` | `"23.40 GBP"`, `"GBP 23.40"`, `"£23.40"`, `"-€5"`, `"(12.00) USD"`, `"1,234.56"` / `7.25` (with the field's currency), `{"amount", "currency"}`, `{"minor", "currency"}` |
 | `date` | TEXT `YYYY-MM-DD` | ISO, `2026/10/3`, `20261013`, `13 Oct 2026`, `October 13, 2026`, `today`, `yesterday`, unambiguous `25/12/2026` |
-| `datetime` | TEXT UTC `YYYY-MM-DDTHH:MM:SSZ` | ISO with or without an offset (read in `timeZone`), `now` |
+| `datetime` | TEXT UTC `YYYY-MM-DDTHH:MM:SSZ` | ISO with or without an offset (read in `timeZone`), `now` — grouped by day, week, month or year on `timeZone`'s calendar |
 | `bool` | INTEGER 0/1 | `true`/`false`, `yes`/`no`, `1`/`0` |
 | `choice` | TEXT | one of the field's `choices`, any case — stored in the declared spelling |
 | `tags` | TEXT JSON array | an array of strings or `"a, b"`; trimmed, de-duplicated |

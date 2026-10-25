@@ -104,6 +104,27 @@ struct QueryTests {
         #expect(monthly.rows.map { $0["total_running"]!.displayText } == ["30.00 GBP", "49.75 GBP"])
     }
 
+    /// Periods are the store's own calendar days: a 20:00 dinner in New York is that day's, though in UTC it is
+    /// already the next. The zone is read when the query runs.
+    @Test func periodsFollowTheStoresTimeZone() throws {
+        let store = try makeStore()
+        store.timeZone = TimeZone(identifier: "America/New_York")!
+        try store.define(Schema.parse(#"{"name": "meals", "fields": ["title:text!", "at:datetime!", "kcal:number"]}"#))
+        for (title, at) in [("breakfast", "2026-10-25T08:00"), ("dinner", "2026-10-25T20:00"), ("lunch", "2026-10-26T12:30"),
+                            ("late", "2026-10-31T21:00")] {
+            try store.add(json(#"{"title": "\#(title)", "at": "\#(at)", "kcal": 100}"#), to: "meals")
+        }
+        func counts(_ period: Grouping.Period) throws -> [String] {
+            try store.query("meals", Query(aggregates: [.count], groupBy: [.period(period)])).rows.map {
+                "\($0[period.rawValue]!.displayText)=\($0["count"]!.displayText)"
+            }
+        }
+        #expect(try counts(.day) == ["2026-10-25=2", "2026-10-26=1", "2026-10-31=1"])
+        #expect(try counts(.month) == ["2026-10=4"], "21:00 on 31 October is October's, though it is 1 November in UTC")
+        store.timeZone = TimeZone(secondsFromGMT: 0)!
+        #expect(try counts(.day) == ["2026-10-25=1", "2026-10-26=2", "2026-11-01=1"])
+    }
+
     @Test func orderLimitAndMinMax() throws {
         let store = try seeded()
         let top = try store.query("expenses", Query(order: [Ordering(key: "total", descending: true)], limit: 2))

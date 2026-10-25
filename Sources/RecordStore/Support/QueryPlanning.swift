@@ -201,7 +201,6 @@ enum QueryPlanning {
         return target
     }
 
-    /// The SELECT expression that buckets a date field into a period.
     /// A summary's sort key as a result column. A field name stands for its
     /// one aggregate — `-total` sorts by `total_sum` when that is the only
     /// `total_…` column; with two (`total_sum`, `total_avg`) it must be named.
@@ -215,8 +214,11 @@ enum QueryPlanning {
         return Ordering(key: candidates[0], descending: ordering.descending)
     }
 
+    /// A datetime is stored in UTC and bucketed on the store's own calendar (`local_time`), so a period
+    /// is the reader's day, not UTC's; a date is already a calendar day.
     static func periodExpression(_ field: Field, _ period: Grouping.Period, table: String? = nil) -> String {
-        let column = (table.map { $0 + "." } ?? "") + SQLText.quoted(field.name)
+        let stored = (table.map { $0 + "." } ?? "") + SQLText.quoted(field.name)
+        let column = field.type == .datetime ? "local_time(\(stored))" : stored
         switch period {
         case .day: return "substr(\(column), 1, 10)"
         case .month: return "substr(\(column), 1, 7)"

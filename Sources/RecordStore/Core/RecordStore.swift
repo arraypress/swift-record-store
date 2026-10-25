@@ -56,6 +56,8 @@ public final class RecordStore {
             }
         }
         db = try Database(path: path)
+        // Weak: the database lives inside the store, and a strong capture would keep both alive.
+        db.defineLocalTime { [weak self] in self?.timeZone ?? .current }
         try db.exec("""
             CREATE TABLE IF NOT EXISTS "_store_schemas" (
                 "name" TEXT PRIMARY KEY, "definition" TEXT NOT NULL,

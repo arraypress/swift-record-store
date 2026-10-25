@@ -104,6 +104,17 @@ enum DateParsing {
                                                   hour: Int(m.4), minute: Int(m.5), second: Int(m.6)))
     }
 
+    /// A stored datetime as wall-clock time in `timeZone` (`YYYY-MM-DD HH:MM:SS`), or nil when it is not one.
+    /// Grouping by day, week, month or year reads this, so a meal at 20:00 in New York is that day's, not
+    /// the next UTC day's.
+    static func local(_ stored: String, timeZone: TimeZone) -> String? {
+        guard let instant = instant(stored) else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let p = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: instant)
+        return format(p.year!, p.month!, p.day!) + " " + pad(p.hour!) + ":" + pad(p.minute!) + ":" + pad(p.second!)
+    }
+
     /// `YYYY-MM-DDTHH:MM:SSZ` for an instant.
     static func utc(_ instant: Date) -> String {
         var calendar = Calendar(identifier: .gregorian)

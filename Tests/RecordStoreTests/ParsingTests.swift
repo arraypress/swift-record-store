@@ -138,4 +138,13 @@ struct SchemaParsingTests {
         #expect(try Filter.parse("tags~work") == Filter(field: "tags", op: .contains, value: "work"))
         #expect(throws: RecordStoreError.self) { try Filter.parse("total is big") }
     }
+
+    @Test func storedDatetimesAsLocalWallClock() {
+        let york = TimeZone(identifier: "America/New_York")!
+        #expect(DateParsing.local("2026-10-26T00:00:00Z", timeZone: york) == "2026-10-25 20:00:00")
+        #expect(DateParsing.local("2026-03-08T07:30:00Z", timeZone: york) == "2026-03-08 03:30:00", "after the spring-forward, EDT")
+        #expect(DateParsing.local("2026-03-08T06:30:00Z", timeZone: york) == "2026-03-08 01:30:00", "before it, EST")
+        #expect(DateParsing.local("2026-10-26", timeZone: york) == nil, "a date is not a stored datetime")
+        #expect(DateParsing.local("soon", timeZone: york) == nil)
+    }
 }

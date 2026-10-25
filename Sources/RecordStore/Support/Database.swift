@@ -70,6 +70,23 @@ final class Database {
         sqlite3_close(handle)
     }
 
+    /// Defines the SQL function `local_time(text)`: a stored UTC datetime as wall-clock time in the zone
+    /// `zone()` gives when the statement runs (see `DateParsing.local`); NULL for anything else.
+    func defineLocalTime(_ zone: @escaping () -> TimeZone) {
+        let box = Unmanaged.passRetained(ZoneBox(zone)).toOpaque()
+        sqlite3_create_function_v2(handle, "local_time", 1, SQLITE_UTF8, box, { context, _, values in
+            let zone = Unmanaged<ZoneBox>.fromOpaque(sqlite3_user_data(context)!).takeUnretainedValue().zone
+            guard let value = values?[0], let text = sqlite3_value_text(value),
+                  let local = DateParsing.local(String(cString: text), timeZone: zone()) else {
+                sqlite3_result_null(context)
+                return
+            }
+            sqlite3_result_text(context, local, -1, transient)
+        }, nil, nil, { box in
+            box.map { Unmanaged<ZoneBox>.fromOpaque($0).release() }
+        })
+    }
+
     /// Runs statements that take no bindings and return no rows.
     func exec(_ sql: String) throws(RecordStoreError) {
         var errorMessage: UnsafeMutablePointer<CChar>?
@@ -180,4 +197,10 @@ final class Database {
         }
         return .storage("\(message) — in: \(sql.prefix(160))")
     }
+}
+
+/// Carries `local_time`'s zone into SQLite's C callback.
+private final class ZoneBox {
+    let zone: () -> TimeZone
+    init(_ zone: @escaping () -> TimeZone) { self.zone = zone }
 }
